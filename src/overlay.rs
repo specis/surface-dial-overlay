@@ -16,15 +16,18 @@ use smithay_client_toolkit::{
     },
     shm::{slot::SlotPool, Shm, ShmHandler},
 };
-use tiny_skia::{Color, FillRule, LineCap, Paint, PathBuilder, Pixmap, Stroke, Transform};
+use tiny_skia::{BlendMode, Color, FillRule, LineCap, Paint, PathBuilder, Pixmap, Stroke, Transform};
 use wayland_client::{
     protocol::{wl_output, wl_shm, wl_surface},
     Connection, QueueHandle,
 };
 
+use crate::config::{OverlayConfig, Style};
 use crate::DialEvent;
 
-const HIDE_AFTER: Duration = Duration::from_secs(2);
+// ---------------------------------------------------------------------------
+// Surface wrapper
+// ---------------------------------------------------------------------------
 
 #[derive(Debug)]
 pub enum SurfaceKind {
@@ -77,6 +80,8 @@ pub struct OverlayState {
     pub configured: bool,
     pub exit: bool,
     pub qh: QueueHandle<OverlayState>,
+
+    pub config: OverlayConfig,
 }
 
 // ---------------------------------------------------------------------------
@@ -107,9 +112,10 @@ impl OverlayState {
     }
 
     pub fn tick_visibility(&mut self) {
+        let timeout = Duration::from_millis(self.config.timeout_ms);
         let stale = self
             .last_event
-            .map(|t| t.elapsed() > HIDE_AFTER)
+            .map(|t| t.elapsed() > timeout)
             .unwrap_or(false);
 
         if stale && (self.rotation_accum != 0.0 || self.is_pressed) {
@@ -148,10 +154,15 @@ impl OverlayState {
             }
         };
 
-        render_frame(&mut pixmap, self.rotation_accum, self.is_pressed);
+        render_frame(
+            &mut pixmap,
+            &self.config,
+            self.rotation_accum,
+            self.is_pressed,
+        );
 
         // tiny-skia = RGBA bytes
-        // wl_shm ARgb8888 on little-endian memory = BGRA byte order
+        // wl_shm ARgb8888 on little-endian = BGRA byte order
         let src = pixmap.data();
         for (d, s) in canvas.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
             d[0] = s[2]; // B
@@ -174,10 +185,15 @@ impl OverlayState {
 }
 
 // ---------------------------------------------------------------------------
-// Rendering
+// Rendering — top-level dispatch
 // ---------------------------------------------------------------------------
 
-fn render_frame(pixmap: &mut Pixmap, rotation_accum: f32, is_pressed: bool) {
+fn render_frame(
+    pixmap: &mut Pixmap,
+    config: &OverlayConfig,
+    rotation_accum: f32,
+    is_pressed: bool,
+) {
     pixmap.fill(Color::TRANSPARENT);
 
     let w = pixmap.width() as f32;
@@ -186,30 +202,67 @@ fn render_frame(pixmap: &mut Pixmap, rotation_accum: f32, is_pressed: bool) {
     let cy = h / 2.0;
     let r = cx.min(cy) * 0.82;
 
-    if is_pressed {
-        draw_press(pixmap, cx, cy, r);
-    } else if rotation_accum.abs() >= 0.5 {
-        draw_rotation(pixmap, cx, cy, r, rotation_accum);
+    match &config.style {
+        Style::PieMenu => {
+            // Pie menu is always shown on rotation or press.
+            if rotation_accum.abs() >= 0.5 || is_pressed {
+                draw_pie_menu(pixmap, cx, cy, r, rotation_accum, is_pressed, config);
+            }
+        }
+        Style::Arc => {
+            if is_pressed {
+                draw_press(pixmap, cx, cy, r, &config.colors);
+            } else if rotation_accum.abs() >= 0.5 {
+                draw_rotation_arc(pixmap, cx, cy, r, rotation_accum, &config.colors);
+            }
+        }
+        Style::Fill => {
+            if is_pressed {
+                draw_press(pixmap, cx, cy, r, &config.colors);
+            } else if rotation_accum.abs() >= 0.5 {
+                draw_rotation_fill(pixmap, cx, cy, r, rotation_accum, &config.colors);
+            }
+        }
     }
 }
 
-fn draw_press(pixmap: &mut Pixmap, cx: f32, cy: f32, r: f32) {
+// ---------------------------------------------------------------------------
+// Shared: press indicator
+// ---------------------------------------------------------------------------
+
+fn draw_press(pixmap: &mut Pixmap, cx: f32, cy: f32, r: f32, colors: &crate::config::Colors) {
+    let p = &colors.press;
+    let bg = &colors.background;
+
     let path = PathBuilder::from_circle(cx, cy, r).expect("circle");
     let mut paint = Paint::default();
-    paint.set_color_rgba8(80, 140, 255, 200);
+    paint.set_color_rgba8(bg[0], bg[1], bg[2], bg[3]);
     paint.anti_alias = true;
     pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
 
     let inner = PathBuilder::from_circle(cx, cy, r * 0.45).expect("inner circle");
-    paint.set_color_rgba8(160, 200, 255, 230);
+    paint.set_color_rgba8(p[0], p[1], p[2], p[3]);
     pixmap.fill_path(&inner, &paint, FillRule::Winding, Transform::identity(), None);
 }
 
-fn draw_rotation(pixmap: &mut Pixmap, cx: f32, cy: f32, r: f32, accum: f32) {
+// ---------------------------------------------------------------------------
+// Arc style (original)
+// ---------------------------------------------------------------------------
+
+fn draw_rotation_arc(
+    pixmap: &mut Pixmap,
+    cx: f32,
+    cy: f32,
+    r: f32,
+    accum: f32,
+    colors: &crate::config::Colors,
+) {
+    // Background ring
     {
+        let bg = &colors.background;
         let ring = PathBuilder::from_circle(cx, cy, r).expect("ring");
         let mut paint = Paint::default();
-        paint.set_color_rgba8(30, 30, 40, 180);
+        paint.set_color_rgba8(bg[0], bg[1], bg[2], bg[3]);
         paint.anti_alias = true;
         let mut stroke = Stroke::default();
         stroke.width = r * 0.18;
@@ -221,12 +274,9 @@ fn draw_rotation(pixmap: &mut Pixmap, cx: f32, cy: f32, r: f32, accum: f32) {
     let start_rad = -std::f32::consts::FRAC_PI_2;
 
     if let Some(path) = build_arc(cx, cy, r * 0.91, start_rad, sweep_rad) {
+        let color = if accum > 0.0 { &colors.cw } else { &colors.ccw };
         let mut paint = Paint::default();
-        if accum > 0.0 {
-            paint.set_color_rgba8(80, 210, 120, 230);
-        } else {
-            paint.set_color_rgba8(220, 90, 80, 230);
-        }
+        paint.set_color_rgba8(color[0], color[1], color[2], color[3]);
         paint.anti_alias = true;
 
         let mut stroke = Stroke::default();
@@ -237,6 +287,120 @@ fn draw_rotation(pixmap: &mut Pixmap, cx: f32, cy: f32, r: f32, accum: f32) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Fill style (default) — filled wedge grows from 12 o'clock
+// ---------------------------------------------------------------------------
+
+fn draw_rotation_fill(
+    pixmap: &mut Pixmap,
+    cx: f32,
+    cy: f32,
+    r: f32,
+    accum: f32,
+    colors: &crate::config::Colors,
+) {
+    // Background circle
+    {
+        let bg = &colors.background;
+        let path = PathBuilder::from_circle(cx, cy, r).expect("bg circle");
+        let mut paint = Paint::default();
+        paint.set_color_rgba8(bg[0], bg[1], bg[2], bg[3]);
+        paint.anti_alias = true;
+        pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+    }
+
+    // Filled wedge from 12 o'clock
+    let sweep_deg = (accum * 15.0).clamp(-360.0, 360.0);
+    let sweep_rad = sweep_deg.to_radians();
+    let start_rad = -std::f32::consts::FRAC_PI_2;
+
+    if let Some(path) = build_pie_slice(cx, cy, r, start_rad, sweep_rad) {
+        let color = if accum > 0.0 { &colors.cw } else { &colors.ccw };
+        let mut paint = Paint::default();
+        paint.set_color_rgba8(color[0], color[1], color[2], color[3]);
+        paint.anti_alias = true;
+        pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pie-menu style
+// ---------------------------------------------------------------------------
+
+fn draw_pie_menu(
+    pixmap: &mut Pixmap,
+    cx: f32,
+    cy: f32,
+    r: f32,
+    accum: f32,
+    is_pressed: bool,
+    config: &OverlayConfig,
+) {
+    let pm = &config.pie_menu;
+    let n = pm.sections.len();
+    if n == 0 {
+        return;
+    }
+
+    // Determine selected section from accumulated rotation.
+    let selected = {
+        let idx = (accum / pm.selection_step).floor() as i32;
+        idx.rem_euclid(n as i32) as usize
+    };
+
+    let section_deg = 360.0_f32 / n as f32;
+    let gap = pm.gap_degrees;
+
+    for i in 0..n {
+        // Start from top (−90°), each section spans section_deg with a gap.
+        let start_deg = i as f32 * section_deg - 90.0 + gap / 2.0;
+        let sweep_deg = section_deg - gap;
+        if sweep_deg <= 0.0 {
+            continue;
+        }
+
+        let color = if i == selected {
+            &pm.selected_color
+        } else {
+            &pm.unselected_color
+        };
+
+        if let Some(path) =
+            build_pie_slice(cx, cy, r, start_deg.to_radians(), sweep_deg.to_radians())
+        {
+            let mut paint = Paint::default();
+            paint.set_color_rgba8(color[0], color[1], color[2], color[3]);
+            paint.anti_alias = true;
+            pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+        }
+    }
+
+    // Donut hole — erase the centre so sections appear as a ring.
+    if let Some(inner) = PathBuilder::from_circle(cx, cy, r * 0.35) {
+        let mut paint = Paint::default();
+        paint.blend_mode = BlendMode::Clear;
+        paint.anti_alias = true;
+        pixmap.fill_path(&inner, &paint, FillRule::Winding, Transform::identity(), None);
+    }
+
+    // Confirm dot — shown while the button is held.
+    if is_pressed {
+        if let Some(dot) = PathBuilder::from_circle(cx, cy, r * 0.18) {
+            let c = &config.colors.press;
+            let mut paint = Paint::default();
+            paint.set_color_rgba8(c[0], c[1], c[2], c[3]);
+            paint.anti_alias = true;
+            pixmap.fill_path(&dot, &paint, FillRule::Winding, Transform::identity(), None);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Path helpers
+// ---------------------------------------------------------------------------
+
+/// Build an open arc (stroke path) on the circle at (cx, cy) with radius r,
+/// starting at `start` radians and sweeping by `sweep` radians.
 fn build_arc(cx: f32, cy: f32, r: f32, start: f32, sweep: f32) -> Option<tiny_skia::Path> {
     if sweep.abs() < 0.001 {
         return None;
@@ -258,18 +422,43 @@ fn build_arc(cx: f32, cy: f32, r: f32, start: f32, sweep: f32) -> Option<tiny_sk
         let cp2x = cx + r * (next.cos() + sign * k * next.sin());
         let cp2y = cy + r * (next.sin() - sign * k * next.cos());
 
-        pb.cubic_to(
-            cp1x,
-            cp1y,
-            cp2x,
-            cp2y,
-            cx + r * next.cos(),
-            cy + r * next.sin(),
-        );
+        pb.cubic_to(cp1x, cp1y, cp2x, cp2y, cx + r * next.cos(), cy + r * next.sin());
 
         angle = next;
     }
 
+    pb.finish()
+}
+
+/// Build a closed pie-slice (filled wedge) from the centre to the arc edge.
+fn build_pie_slice(cx: f32, cy: f32, r: f32, start: f32, sweep: f32) -> Option<tiny_skia::Path> {
+    if sweep.abs() < 0.001 {
+        return None;
+    }
+
+    let n = ((sweep.abs() / std::f32::consts::FRAC_PI_2).ceil() as u32).max(1);
+    let seg = sweep / n as f32;
+    let k = (4.0 / 3.0) * ((seg / 2.0).abs().tan());
+
+    let mut pb = PathBuilder::new();
+    pb.move_to(cx, cy);
+    pb.line_to(cx + r * start.cos(), cy + r * start.sin());
+
+    let mut angle = start;
+    for _ in 0..n {
+        let next = angle + seg;
+        let sign = seg.signum();
+        let cp1x = cx + r * (angle.cos() - sign * k * angle.sin());
+        let cp1y = cy + r * (angle.sin() + sign * k * angle.cos());
+        let cp2x = cx + r * (next.cos() + sign * k * next.sin());
+        let cp2y = cy + r * (next.sin() - sign * k * next.cos());
+
+        pb.cubic_to(cp1x, cp1y, cp2x, cp2y, cx + r * next.cos(), cy + r * next.sin());
+
+        angle = next;
+    }
+
+    pb.close();
     pb.finish()
 }
 

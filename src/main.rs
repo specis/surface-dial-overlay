@@ -1,3 +1,4 @@
+mod config;
 mod dbus;
 mod overlay;
 
@@ -76,6 +77,9 @@ fn main() -> Result<()> {
 
     println!("Starting surface-dial-overlay...");
 
+    let config = config::load_config();
+    let overlay_size = config.size;
+
     // --- Wayland connection and global enumeration ---
     let conn = Connection::connect_to_env()
         .map_err(|e| anyhow!("Failed to connect to Wayland compositor: {e}"))?;
@@ -105,7 +109,7 @@ fn main() -> Result<()> {
             );
 
             layer.set_anchor(Anchor::empty());
-            layer.set_size(200, 200);
+            layer.set_size(overlay_size, overlay_size);
             layer.set_exclusive_zone(-1);
             layer.set_keyboard_interactivity(KeyboardInteractivity::None);
             layer.commit();
@@ -127,7 +131,7 @@ fn main() -> Result<()> {
     };
 
     // --- Shared memory pool ---
-    let pool = SlotPool::new(200 * 200 * 4 * 2, &shm)?;
+    let pool = SlotPool::new((overlay_size * overlay_size * 4 * 2) as usize, &shm)?;
 
     // --- calloop event loop ---
     let mut event_loop: EventLoop<OverlayState> = EventLoop::try_new()?;
@@ -167,14 +171,15 @@ fn main() -> Result<()> {
         shm,
         surface,
         pool,
-        width: 200,
-        height: 200,
+        width: overlay_size,
+        height: overlay_size,
         rotation_accum: 0.0,
         is_pressed: false,
         last_event: None,
         configured: false,
         exit: false,
         qh: qh.clone(),
+        config,
     };
 
     println!("Event loop started");

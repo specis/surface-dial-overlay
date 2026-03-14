@@ -175,6 +175,8 @@ fn main() -> Result<()> {
         height: overlay_size,
         rotation_accum: 0.0,
         is_pressed: false,
+        menu_active: false,
+        menu_accum: 0.0,
         last_event: None,
         configured: false,
         exit: false,

@@ -1,6 +1,6 @@
 # surface-dial-overlay
 
-A Wayland overlay for the Microsoft Surface Dial. It listens for dial events broadcast over D-Bus and renders a configurable visual indicator on screen.
+A Wayland overlay for the Microsoft Surface Dial. It listens for dial events broadcast over D-Bus and renders a Windows Fluent-style visual indicator on screen.
 
 ## How it works
 
@@ -20,88 +20,86 @@ The daemon (a separate project) handles raw evdev input and re-broadcasts events
 
 ## Visual styles
 
-Three styles are available, selected via the config file:
+Four styles are available, selected in the config file.
 
-### `fill` (default)
+### `dial` (default) — Windows Fluent experience
 
-A dark background circle with a coloured wedge that grows from 12 o'clock as you rotate. Green for clockwise, red for counter-clockwise. Pressing the button shows a filled circle.
+Matches the Windows Surface Dial interaction model:
+
+| Gesture | Visual |
+|---|---|
+| **Rotate** (button up) | Dark Fluent disc + glowing accent-blue arc. A white tip dot marks the current position on the arc. |
+| **Press & hold** | Radial menu appears — sections arranged around a dark disc with a Fluent centre hub and subtle outer ring. |
+| **Rotate while held** | Selection advances through sections (wraps around). An accent-colour dot tracks the selected section. |
+| **Release** | Menu closes immediately. |
+
+### `fill`
+
+A dark background disc with a coloured wedge that grows from 12 o'clock as you rotate. Pressing shows a filled press circle.
 
 ### `arc`
 
-The original style — a dark ring stroke with a coloured arc that traces the rotation amount. Pressing the button shows a filled circle.
+Ring stroke with a coloured arc that traces the rotation amount.
 
 ### `pie_menu`
 
-The circle is split into equal sections (one per configured label). Rotating highlights adjacent sections in sequence, wrapping around. Holding the button shows a small confirm dot in the centre.
-
-### State summary
-
-| Dial action | `fill` / `arc` | `pie_menu` |
-|---|---|---|
-| Idle | Transparent | Transparent |
-| Rotating CW | Green wedge / arc grows | Next section highlighted |
-| Rotating CCW | Red wedge / arc shrinks | Previous section highlighted |
-| Pressed | Filled press circle | Confirm dot in centre |
+Circle always split into sections while rotating. Rotation changes selection continuously without requiring a button press.
 
 ## Configuration
 
-The config file is read from:
+Config file location:
 
 ```
 ~/.config/surface-dial-overlay/config.toml
 ```
 
-If the file does not exist the overlay starts with sensible defaults (`fill` style, 2 s timeout, 200 px).
+Missing keys fall back to defaults. The file does not need to exist.
 
 ### Full example
 
 ```toml
-# Style: "fill" (default), "arc", or "pie_menu"
-style = "fill"
+# Style: "dial" (default), "fill", "arc", "pie_menu"
+style = "dial"
 
 # Hide the overlay this many milliseconds after the last event.
 timeout_ms = 2000
 
 # Overlay size in pixels.
-size = 200
+size = 240
 
 [colors]
-# All colours are [red, green, blue, alpha] with values 0–255.
-cw         = [80, 210, 120, 230]   # clockwise rotation
-ccw        = [220, 90,  80,  230]  # counter-clockwise rotation
-press      = [80, 140, 255, 200]   # button press indicator
-background = [30, 30,  40,  180]   # background circle / ring
+# All colours: [red, green, blue, alpha]  (0–255)
+cw         = [0, 120, 212, 240]    # accent blue — arc indicator
+ccw        = [0, 120, 212, 240]    # same for dial style
+press      = [0, 120, 212, 255]    # confirmation dot
+background = [28, 28, 28, 230]     # Fluent dark surface
 
 [pie_menu]
-# One entry per section. The number of entries sets the section count.
-sections = ["Volume", "Brightness", "Scroll", "Zoom"]
+# Section labels — also used by the "dial" radial menu.
+# Maximum ~7 items recommended.
+sections = ["Volume", "Scroll", "Zoom", "Undo"]
 
-# Colour of the currently highlighted section.
-selected_color   = [80, 140, 255, 230]
+# Highlight colour for the selected section.
+selected_color   = [255, 255, 255, 215]
 
-# Colour of all other sections.
-unselected_color = [50, 50,  60,  180]
+# Colour for unselected sections.
+unselected_color = [255, 255, 255, 32]
 
-# Visual gap between sections in degrees.
-gap_degrees = 4.0
+# Gap between sections in degrees.
+gap_degrees = 3.0
 
-# Raw rotation delta units needed to advance one section.
-# Lower = more sensitive. Default: 5.0
+# Raw rotation delta to advance one section. Lower = more sensitive.
 selection_step = 5.0
 ```
-
-Any key not present in the file falls back to the default value, so a minimal config only needs to set what you want to override.
 
 ## Requirements
 
 - A Wayland compositor with [`wlr-layer-shell`](https://wayland.app/protocols/wlr-layer-shell-unstable-v1) support (Sway, Hyprland, KDE Plasma, GNOME 45+, etc.)
 - The `dialmenu` daemon running and broadcasting on the session D-Bus
 
-If the compositor does not support `wlr-layer-shell` the overlay falls back to a standard XDG window so the program can still run.
+If the compositor does not support `wlr-layer-shell` the overlay falls back to a standard XDG window.
 
 ### D-Bus interface
-
-The overlay connects to:
 
 | Property | Value |
 |---|---|
@@ -113,7 +111,7 @@ Signals consumed:
 
 | Signal | Arguments | Meaning |
 |---|---|---|
-| `DialRotated` | `delta: i32` (+1 or −1) | One step of rotation |
+| `DialRotated` | `delta: i32` | One step of rotation |
 | `DialPressed` | — | Button pressed |
 | `DialReleased` | — | Button released |
 
@@ -129,7 +127,7 @@ cargo build --release
 cargo run --release
 ```
 
-Enable debug logging with:
+Enable debug logging:
 
 ```sh
 RUST_LOG=debug cargo run --release
@@ -140,12 +138,22 @@ RUST_LOG=debug cargo run --release
 ```
 src/
 ├── main.rs      # Entry point: Wayland init, calloop event loop, D-Bus thread
-├── config.rs    # TOML config loading and style/colour types
+├── config.rs    # TOML config loading, style/colour/menu types
 ├── dbus.rs      # zbus proxy and async signal listener
 └── overlay.rs   # Wayland surface, SCTK delegates, style-dispatched rendering
 ```
 
 ### Threading model
 
-- **Main thread** — `calloop` event loop dispatching both Wayland protocol events and D-Bus channel messages
+- **Main thread** — `calloop` event loop dispatching Wayland protocol events and D-Bus channel messages; 100 ms heartbeat for visibility timeout
 - **D-Bus thread** — single-threaded `tokio` runtime running the async `zbus` signal listener; forwards events through a `calloop::channel` to the main thread
+
+### Arc rendering
+
+Circular arcs are approximated using cubic Bézier curves, split into at most 90° segments. The control-point distance factor is:
+
+```
+k = (4/3) · tan(α/4)
+```
+
+where `α` is the sweep angle of one segment. This gives a maximum radial error of ~0.06% of the radius — indistinguishable from a true circle at any overlay size.

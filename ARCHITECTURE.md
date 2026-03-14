@@ -16,6 +16,8 @@ classDiagram
         +height: u32
         +rotation_accum: f32
         +is_pressed: bool
+        +menu_active: bool
+        +menu_accum: f32
         +last_event: Option~Instant~
         +configured: bool
         +exit: bool
@@ -51,8 +53,9 @@ classDiagram
 
     class Style {
         <<enumeration>>
-        Arc
+        Dial
         Fill
+        Arc
         PieMenu
     }
 
@@ -178,7 +181,7 @@ graph TB
     XDG        -.->|composite|     SCREEN
 ```
 
-## Sequence Diagram — Dial Rotation Event
+## Sequence Diagram — Dial Rotation (no button hold)
 
 ```mermaid
 sequenceDiagram
@@ -197,11 +200,38 @@ sequenceDiagram
     Proxy ->>  Chan   : send(DialEvent::Rotated(delta))
     Chan  ->>  State  : calloop dispatches Msg
     State ->>  State  : rotation_accum += delta\nlast_event = now()
-    State ->>  Skia   : render_frame(config, accum, pressed)
+    State ->>  Skia   : render_frame → draw_dial_rotation
     Skia  ->>  State  : pixmap (RGBA)
     State ->>  State  : RGBA → BGRA conversion
     State ->>  Wl     : damage_buffer + attach + commit
     Wl    ->>  Wl     : composites overlay on screen
+```
+
+## Sequence Diagram — Dial Menu (press & hold)
+
+```mermaid
+sequenceDiagram
+    actor Dial as Surface Dial
+    participant State as OverlayState
+    participant Skia as tiny-skia
+    participant Wl as Wayland compositor
+
+    Dial  ->>  State : DialPressed
+    State ->>  State : is_pressed = true\nmenu_active = true\nmenu_accum = 0
+    State ->>  Skia  : render_frame → draw_dial_menu
+    Skia  ->>  Wl    : radial menu committed
+
+    loop While held
+        Dial  ->>  State : DialRotated(delta)
+        State ->>  State : menu_accum += delta
+        State ->>  Skia  : render_frame → draw_dial_menu (new selection)
+        Skia  ->>  Wl    : updated menu committed
+    end
+
+    Dial  ->>  State : DialReleased
+    State ->>  State : is_pressed = false\nmenu_active = false
+    State ->>  Skia  : render_frame → transparent
+    Skia  ->>  Wl    : transparent buffer committed
 ```
 
 ## Sequence Diagram — Visibility Timeout
@@ -216,7 +246,7 @@ sequenceDiagram
     loop Every 100 ms
         Loop  ->> State : tick_visibility()
         alt last_event elapsed > timeout_ms
-            State ->> State : rotation_accum = 0\nis_pressed = false
+            State ->> State : rotation_accum = 0\nis_pressed = false\nmenu_active = false\nmenu_accum = 0
             State ->> Skia  : render_frame → transparent
             Skia  ->> State : empty pixmap
             State ->> Wl    : commit transparent buffer
@@ -233,19 +263,41 @@ flowchart TD
     RF[render_frame]
     RF --> PM{style?}
 
-    PM -->|PieMenu| VIS1{rotation ≥ 0.5\nor pressed?}
-    VIS1 -->|yes| PIEMENU[draw_pie_menu\nN equal wedges\ndiscrete selection\nconfirm dot on press]
-    VIS1 -->|no| CLEAR1[transparent]
+    PM -->|Dial| D1{menu_active?}
+    D1 -->|yes| DIALMENU[draw_dial_menu\nFluent dark disc\nN sections + centre hub\naccent dot on selection]
+    D1 -->|no| D2{rotation ≥ 0.5?}
+    D2 -->|yes| DIALARC[draw_dial_rotation\nFluent dark disc\nglowing accent arc\nwhite tip dot]
+    D2 -->|no| CLEAR0[transparent]
+
+    PM -->|Fill| VIS3{pressed?}
+    VIS3 -->|yes| PRESS_B[draw_press\nbg disc + inner dot]
+    VIS3 -->|no| VIS3B{rotation ≥ 0.5?}
+    VIS3B -->|yes| FILL[draw_rotation_fill\ndark bg disc\n+ filled wedge from 12 o'clock]
+    VIS3B -->|no| CLEAR3[transparent]
 
     PM -->|Arc| VIS2{pressed?}
-    VIS2 -->|yes| PRESS_A[draw_press\nbg circle + inner dot]
+    VIS2 -->|yes| PRESS_A[draw_press\nbg disc + inner dot]
     VIS2 -->|no| VIS2B{rotation ≥ 0.5?}
     VIS2B -->|yes| ARC[draw_rotation_arc\ndark ring stroke\n+ coloured arc stroke]
     VIS2B -->|no| CLEAR2[transparent]
 
-    PM -->|Fill| VIS3{pressed?}
-    VIS3 -->|yes| PRESS_B[draw_press\nbg circle + inner dot]
-    VIS3 -->|no| VIS3B{rotation ≥ 0.5?}
-    VIS3B -->|yes| FILL[draw_rotation_fill\ndark bg circle\n+ filled wedge from 12 o'clock]
-    VIS3B -->|no| CLEAR3[transparent]
+    PM -->|PieMenu| VIS1{rotation ≥ 0.5\nor pressed?}
+    VIS1 -->|yes| PIEMENU[draw_pie_menu\nN equal wedges\ndiscrete selection\nconfirm dot on press]
+    VIS1 -->|no| CLEAR1[transparent]
 ```
+
+## Arc Rendering — Bézier Approximation
+
+Circular arcs are drawn as cubic Bézier curves. Each arc is split into segments of at most 90° and the control-point distance is:
+
+```
+k = (4/3) · tan(α/4)
+```
+
+where `α` is the sweep of one segment. For a 90° segment this gives `k ≈ 0.552`, keeping the curve within ~0.06% of the true circle radius.
+
+> **Note:** Using `tan(α/2)` instead (a common mistake) gives `k = 1.333` for 90° segments,
+> pushing control points ~33% of the radius outside the circle and producing the
+> rounded-rectangle artefact visible when the formula is wrong.
+
+The same helper (`build_arc` for stroked paths, `build_pie_slice` for filled wedges) is shared across all four styles.

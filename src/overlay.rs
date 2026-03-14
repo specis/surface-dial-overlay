@@ -3,11 +3,16 @@ use std::time::{Duration, Instant};
 use smithay_client_toolkit::{
     compositor::CompositorHandler,
     delegate_compositor, delegate_layer, delegate_output, delegate_registry, delegate_shm,
+    delegate_xdg_window, delegate_xdg_shell,
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
     shell::{
         wlr_layer::{LayerShellHandler, LayerSurface, LayerSurfaceConfigure},
+        xdg::{
+            window::{Window, WindowConfigure, WindowHandler},
+            XdgShellHandler,
+        },
         WaylandSurface,
     },
     shm::{slot::SlotPool, Shm, ShmHandler},
@@ -22,30 +27,54 @@ use crate::DialEvent;
 
 const HIDE_AFTER: Duration = Duration::from_secs(2);
 
+#[derive(Debug)]
+pub enum SurfaceKind {
+    Layer(LayerSurface),
+    Window(Window),
+}
+
+impl SurfaceKind {
+    pub fn wl_surface(&self) -> &wl_surface::WlSurface {
+        match self {
+            SurfaceKind::Layer(layer) => layer.wl_surface(),
+            SurfaceKind::Window(window) => window.wl_surface(),
+        }
+    }
+
+    pub fn commit(&self) {
+        match self {
+            SurfaceKind::Layer(layer) => layer.commit(),
+            SurfaceKind::Window(window) => window.commit(),
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            SurfaceKind::Layer(_) => "layer-shell",
+            SurfaceKind::Window(_) => "xdg-window",
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // State struct
 // ---------------------------------------------------------------------------
 
 pub struct OverlayState {
-    // SCTK protocol objects required by delegate macros
     pub registry_state: RegistryState,
     pub output_state: OutputState,
     pub shm: Shm,
 
-    // Layer surface and its shared-memory pool
-    pub layer: LayerSurface,
+    pub surface: SurfaceKind,
     pub pool: SlotPool,
 
-    // Overlay size (set from the configure event)
     pub width: u32,
     pub height: u32,
 
-    // Dial state machine
-    pub rotation_accum: f32, // net rotation steps since last idle reset
+    pub rotation_accum: f32,
     pub is_pressed: bool,
     pub last_event: Option<Instant>,
 
-    // Bookkeeping
     pub configured: bool,
     pub exit: bool,
     pub qh: QueueHandle<OverlayState>,
@@ -56,7 +85,6 @@ pub struct OverlayState {
 // ---------------------------------------------------------------------------
 
 impl OverlayState {
-    /// Called from the calloop channel callback for each incoming DialEvent.
     pub fn handle_dial_event(&mut self, event: DialEvent) {
         self.last_event = Some(Instant::now());
 
@@ -79,7 +107,6 @@ impl OverlayState {
         }
     }
 
-    /// Called from the event loop idle callback (~10 Hz) to auto-hide.
     pub fn tick_visibility(&mut self) {
         let stale = self
             .last_event
@@ -89,6 +116,7 @@ impl OverlayState {
         if stale && (self.rotation_accum != 0.0 || self.is_pressed) {
             self.rotation_accum = 0.0;
             self.is_pressed = false;
+
             if self.configured {
                 let qh = self.qh.clone();
                 self.draw(&qh);
@@ -96,10 +124,9 @@ impl OverlayState {
         }
     }
 
-    /// Render the current state into a new SHM buffer and commit it.
     pub fn draw(&mut self, _qh: &QueueHandle<Self>) {
-        let w = self.width;
-        let h = self.height;
+        let w = self.width.max(1);
+        let h = self.height.max(1);
 
         let (buffer, canvas) = match self.pool.create_buffer(
             w as i32,
@@ -114,32 +141,41 @@ impl OverlayState {
             }
         };
 
-        // Render into a tiny-skia Pixmap (RGBA, premultiplied alpha)
         let mut pixmap = match Pixmap::new(w, h) {
             Some(p) => p,
-            None => return,
+            None => {
+                log::error!("Pixmap::new failed for {}x{}", w, h);
+                return;
+            }
         };
+
         render_frame(&mut pixmap, self.rotation_accum, self.is_pressed);
 
-        // Swizzle RGBA (tiny-skia) → BGRA in memory (Wayland ARGB8888 little-endian)
+        // tiny-skia = RGBA bytes
+        // wl_shm ARgb8888 on little-endian memory = BGRA byte order
         let src = pixmap.data();
         for (d, s) in canvas.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
-            d[0] = s[2]; // B ← skia R
-            d[1] = s[1]; // G ← skia G
-            d[2] = s[0]; // R ← skia B
-            d[3] = s[3]; // A ← skia A
+            d[0] = s[2]; // B
+            d[1] = s[1]; // G
+            d[2] = s[0]; // R
+            d[3] = s[3]; // A
         }
-        let _ = canvas; // end the canvas borrow before calling surface methods
+        let _ = canvas;
 
-        // Damage the whole surface, then attach + commit
-        self.layer.wl_surface().damage_buffer(0, 0, w as i32, h as i32);
-        buffer.attach_to(self.layer.wl_surface()).expect("attach buffer");
-        self.layer.commit();
+        let wl_surface = self.surface.wl_surface();
+        wl_surface.damage_buffer(0, 0, w as i32, h as i32);
+
+        if let Err(e) = buffer.attach_to(wl_surface) {
+            log::error!("attach buffer failed on {}: {e}", self.surface.name());
+            return;
+        }
+
+        self.surface.commit();
     }
 }
 
 // ---------------------------------------------------------------------------
-// Rendering (pure functions, no Wayland)
+// Rendering
 // ---------------------------------------------------------------------------
 
 fn render_frame(pixmap: &mut Pixmap, rotation_accum: f32, is_pressed: bool) {
@@ -156,7 +192,6 @@ fn render_frame(pixmap: &mut Pixmap, rotation_accum: f32, is_pressed: bool) {
     } else if rotation_accum.abs() >= 0.5 {
         draw_rotation(pixmap, cx, cy, r, rotation_accum);
     }
-    // Idle: leave fully transparent
 }
 
 fn draw_press(pixmap: &mut Pixmap, cx: f32, cy: f32, r: f32) {
@@ -172,7 +207,6 @@ fn draw_press(pixmap: &mut Pixmap, cx: f32, cy: f32, r: f32) {
 }
 
 fn draw_rotation(pixmap: &mut Pixmap, cx: f32, cy: f32, r: f32, accum: f32) {
-    // Dark background ring
     {
         let ring = PathBuilder::from_circle(cx, cy, r).expect("ring");
         let mut paint = Paint::default();
@@ -183,31 +217,32 @@ fn draw_rotation(pixmap: &mut Pixmap, cx: f32, cy: f32, r: f32, accum: f32) {
         pixmap.stroke_path(&ring, &paint, &stroke, Transform::identity(), None);
     }
 
-    // Arc indicator: sweep proportional to accum, capped at ±300°
     let sweep_deg = (accum * 15.0).clamp(-300.0, 300.0);
     let sweep_rad = sweep_deg.to_radians();
-    let start_rad = -std::f32::consts::FRAC_PI_2; // 12 o'clock
+    let start_rad = -std::f32::consts::FRAC_PI_2;
 
     if let Some(path) = build_arc(cx, cy, r * 0.91, start_rad, sweep_rad) {
         let mut paint = Paint::default();
         if accum > 0.0 {
-            paint.set_color_rgba8(80, 210, 120, 230); // green = clockwise
+            paint.set_color_rgba8(80, 210, 120, 230);
         } else {
-            paint.set_color_rgba8(220, 90, 80, 230); // red = counter-clockwise
+            paint.set_color_rgba8(220, 90, 80, 230);
         }
         paint.anti_alias = true;
+
         let mut stroke = Stroke::default();
         stroke.width = r * 0.15;
         stroke.line_cap = LineCap::Round;
+
         pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
     }
 }
 
-/// Approximate a circular arc with cubic Bézier segments (≤90° each).
 fn build_arc(cx: f32, cy: f32, r: f32, start: f32, sweep: f32) -> Option<tiny_skia::Path> {
     if sweep.abs() < 0.001 {
         return None;
     }
+
     let n = ((sweep.abs() / std::f32::consts::FRAC_PI_2).ceil() as u32).max(1);
     let seg = sweep / n as f32;
     let k = (4.0 / 3.0) * ((seg / 2.0).abs().tan());
@@ -223,7 +258,16 @@ fn build_arc(cx: f32, cy: f32, r: f32, start: f32, sweep: f32) -> Option<tiny_sk
         let cp1y = cy + r * (angle.sin() + sign * k * angle.cos());
         let cp2x = cx + r * (next.cos() + sign * k * next.sin());
         let cp2y = cy + r * (next.sin() - sign * k * next.cos());
-        pb.cubic_to(cp1x, cp1y, cp2x, cp2y, cx + r * next.cos(), cy + r * next.sin());
+
+        pb.cubic_to(
+            cp1x,
+            cp1y,
+            cp2x,
+            cp2y,
+            cx + r * next.cos(),
+            cy + r * next.sin(),
+        );
+
         angle = next;
     }
 
@@ -236,29 +280,49 @@ fn build_arc(cx: f32, cy: f32, r: f32, start: f32, sweep: f32) -> Option<tiny_sk
 
 impl CompositorHandler for OverlayState {
     fn scale_factor_changed(
-        &mut self, _: &Connection, _: &QueueHandle<Self>,
-        _: &wl_surface::WlSurface, _: i32,
-    ) {}
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_surface::WlSurface,
+        _: i32,
+    ) {
+    }
 
     fn transform_changed(
-        &mut self, _: &Connection, _: &QueueHandle<Self>,
-        _: &wl_surface::WlSurface, _: wl_output::Transform,
-    ) {}
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_surface::WlSurface,
+        _: wl_output::Transform,
+    ) {
+    }
 
     fn frame(
-        &mut self, _: &Connection, _: &QueueHandle<Self>,
-        _: &wl_surface::WlSurface, _: u32,
-    ) {}
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_surface::WlSurface,
+        _: u32,
+    ) {
+    }
 
     fn surface_enter(
-        &mut self, _: &Connection, _: &QueueHandle<Self>,
-        _: &wl_surface::WlSurface, _: &wl_output::WlOutput,
-    ) {}
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_surface::WlSurface,
+        _: &wl_output::WlOutput,
+    ) {
+    }
 
     fn surface_leave(
-        &mut self, _: &Connection, _: &QueueHandle<Self>,
-        _: &wl_surface::WlSurface, _: &wl_output::WlOutput,
-    ) {}
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_surface::WlSurface,
+        _: &wl_output::WlOutput,
+    ) {
+    }
 }
 
 impl ShmHandler for OverlayState {
@@ -274,7 +338,13 @@ impl OutputHandler for OverlayState {
 
     fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
     fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
-    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+    fn output_destroyed(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: wl_output::WlOutput,
+    ) {
+    }
 }
 
 impl LayerShellHandler for OverlayState {
@@ -294,13 +364,49 @@ impl LayerShellHandler for OverlayState {
         }
 
         if !self.configured {
+            log::info!("Layer-shell surface configured: {}x{}", self.width, self.height);
             self.configured = true;
-            self.draw(qh); // initial transparent frame
+            self.draw(qh);
         }
     }
 
     fn closed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _layer: &LayerSurface) {
+        log::info!("Layer-shell surface closed");
         self.exit = true;
+    }
+}
+
+impl XdgShellHandler for OverlayState {}
+
+impl WindowHandler for OverlayState {
+    fn request_close(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _window: &Window) {
+        log::info!("XDG window close requested");
+        self.exit = true;
+    }
+
+    fn configure(
+        &mut self,
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+        _window: &Window,
+        configure: WindowConfigure,
+        _serial: u32,
+    ) {
+        if let Some((w, h)) = configure.new_size {
+            if w > 0 {
+                self.width = w;
+            }
+            if h > 0 {
+                self.height = h;
+            }
+        }
+
+        if !self.configured {
+            log::info!("XDG window configured: {}x{}", self.width, self.height);
+            self.configured = true;
+        }
+
+        self.draw(qh);
     }
 }
 
@@ -316,4 +422,6 @@ delegate_compositor!(OverlayState);
 delegate_output!(OverlayState);
 delegate_shm!(OverlayState);
 delegate_layer!(OverlayState);
+delegate_xdg_shell!(OverlayState);
+delegate_xdg_window!(OverlayState);
 delegate_registry!(OverlayState);

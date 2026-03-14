@@ -11,7 +11,6 @@ use smithay_client_toolkit::{
         wlr_layer::{LayerShellHandler, LayerSurface, LayerSurfaceConfigure},
         xdg::{
             window::{Window, WindowConfigure, WindowHandler},
-            XdgShellHandler,
         },
         WaylandSurface,
     },
@@ -376,8 +375,6 @@ impl LayerShellHandler for OverlayState {
     }
 }
 
-impl XdgShellHandler for OverlayState {}
-
 impl WindowHandler for OverlayState {
     fn request_close(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _window: &Window) {
         log::info!("XDG window close requested");
@@ -392,13 +389,12 @@ impl WindowHandler for OverlayState {
         configure: WindowConfigure,
         _serial: u32,
     ) {
-        if let Some((w, h)) = configure.new_size {
-            if w > 0 {
-                self.width = w;
-            }
-            if h > 0 {
-                self.height = h;
-            }
+        let (w, h) = configure.new_size;
+        if let Some(w) = w {
+            self.width = w.get();
+        }
+        if let Some(h) = h {
+            self.height = h.get();
         }
 
         if !self.configured {

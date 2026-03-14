@@ -14,7 +14,7 @@ use smithay_client_toolkit::{
     registry::RegistryState,
     shell::{
         wlr_layer::{Anchor, KeyboardInteractivity, Layer, LayerShell},
-        xdg::{window::Window, XdgShell},
+        xdg::{window::WindowDecorations, XdgShell},
         WaylandSurface,
     },
     shm::{slot::SlotPool, Shm},
@@ -30,12 +30,14 @@ pub enum DialEvent {
 
 fn print_globals(globals: &wayland_client::globals::GlobalList) {
     println!("--- Wayland Globals Detected ---");
-    for g in globals.contents() {
-        println!(
-            "interface: {:<30} version: {:<2} name: {}",
-            g.interface, g.version, g.name
-        );
-    }
+    globals.contents().with_list(|list| {
+        for g in list {
+            println!(
+                "interface: {:<30} version: {:<2} name: {}",
+                g.interface, g.version, g.name
+            );
+        }
+    });
     println!("--------------------------------");
 }
 
@@ -115,11 +117,9 @@ fn main() -> Result<()> {
             println!("Falling back to XDG window mode");
 
             let xdg = try_bind_xdg_shell(&globals, &qh)?;
-            let window = Window::builder()
-                .title("Surface Dial Overlay")
-                .app_id("surface-dial-overlay")
-                .map(&xdg, base_surface, &qh)?;
-
+            let window = xdg.create_window(base_surface, WindowDecorations::RequestServer, &qh);
+            window.set_title("Surface Dial Overlay");
+            window.set_app_id("surface-dial-overlay");
             window.commit();
 
             SurfaceKind::Window(window)
